@@ -389,8 +389,8 @@ client.once("clientReady", () => {
   console.log(`${client.user.tag} is online!`);
 
   client.user.setPresence({
-    activities: [{ name: "causing chaos 💛" }],
-    status: "online"
+    activities: [{ name: "UwU 💛" }],
+    status: "Idle"
   });
 
   // RANDOM MESSAGES EVERY 30 MINUTES
