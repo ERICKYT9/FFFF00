@@ -12,8 +12,22 @@ const {
   Routes,
   SlashCommandBuilder,
   EmbedBuilder,
-  PermissionFlagsBits
+  PermissionFlagsBits,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle
 } = require("discord.js");
+
+const {
+  joinVoiceChannel,
+  createAudioPlayer,
+  createAudioResource,
+  AudioPlayerStatus,
+  VoiceConnectionStatus,
+  entersState,
+  NoSubscriberBehavior
+} = require("@discordjs/voice");
+const play = require("play-dl");
 
 // CONFIGURATION
 const TOKEN = process.env.DISCORD_TOKEN;
@@ -55,7 +69,9 @@ function getUser(guildId, userId) {
       messages: 0,
       lastDaily: 0,
       lastWork: 0,
-      lastXP: 0
+      lastXP: 0,
+      lastRob: 0,
+      lastCrime: 0
     };
   }
 
@@ -107,6 +123,75 @@ const client = new Client({
   ]
 });
 
+// MUSIC PLAYER (YouTube search/URL via play-dl)
+const musicQueues = new Map();
+
+function getMusicQueue(guildId) {
+  if (!musicQueues.has(guildId)) {
+    const player = createAudioPlayer({
+      behaviors: { noSubscriber: NoSubscriberBehavior.Pause }
+    });
+    const queue = {
+      guildId,
+      connection: null,
+      player,
+      songs: [],
+      current: null,
+      volume: 50,
+      textChannel: null,
+      starting: false
+    };
+
+    player.on(AudioPlayerStatus.Idle, () => {
+      queue.current = null;
+      playNext(queue).catch(console.error);
+    });
+    player.on("error", error => {
+      console.error("Music player error:", error);
+      queue.textChannel?.send("⚠️ There was a problem playing that track. Skipping...").catch(() => {});
+      queue.current = null;
+      playNext(queue).catch(console.error);
+    });
+    musicQueues.set(guildId, queue);
+  }
+  return musicQueues.get(guildId);
+}
+
+async function playNext(queue) {
+  if (queue.starting || queue.current || queue.songs.length === 0) return;
+  queue.starting = true;
+  const song = queue.songs.shift();
+
+  try {
+    if (!queue.connection || queue.connection.state.status === VoiceConnectionStatus.Destroyed) {
+      queue.starting = false;
+      return;
+    }
+    const stream = await play.stream(song.url, { quality: 2 });
+    const resource = createAudioResource(stream.stream, {
+      inputType: stream.type,
+      inlineVolume: true
+    });
+    resource.volume.setVolume(queue.volume / 100);
+    queue.current = { ...song, resource };
+    queue.player.play(resource);
+    queue.textChannel?.send(`🎶 Now playing: **${song.title}**`).catch(() => {});
+  } catch (error) {
+    console.error("Could not play track:", error);
+    queue.textChannel?.send(`⚠️ Couldn't play **${song.title}**. Skipping it.`).catch(() => {});
+    queue.current = null;
+  } finally {
+    queue.starting = false;
+    if (!queue.current && queue.songs.length) {
+      setImmediate(() => playNext(queue).catch(console.error));
+    }
+  }
+}
+
+function getMemberVoiceChannel(interaction) {
+  return interaction.member?.voice?.channel || null;
+}
+
 // SLASH COMMANDS
 const commands = [
 
@@ -147,6 +232,36 @@ const commands = [
       .setDescription("Your bet").setMinValue(1).setMaxValue(10000).setRequired(true)),
 
   new SlashCommandBuilder()
+    .setName("slots")
+    .setDescription("Spin the slot machine for virtual coins")
+    .addIntegerOption(o => o.setName("bet")
+      .setDescription("Your bet").setMinValue(1).setMaxValue(10000).setRequired(true)),
+
+  new SlashCommandBuilder()
+    .setName("dice")
+    .setDescription("Guess the die result and win coins")
+    .addIntegerOption(o => o.setName("guess")
+      .setDescription("Pick a number from 1 to 6").setMinValue(1).setMaxValue(6).setRequired(true))
+    .addIntegerOption(o => o.setName("bet")
+      .setDescription("Your bet").setMinValue(1).setMaxValue(10000).setRequired(true)),
+
+  new SlashCommandBuilder()
+    .setName("rob")
+    .setDescription("Try to steal virtual coins from another member")
+    .addUserOption(o => o.setName("user")
+      .setDescription("Who to rob").setRequired(true)),
+
+  new SlashCommandBuilder()
+    .setName("crime")
+    .setDescription("Take a risky job for a possible virtual-coin reward"),
+
+  new SlashCommandBuilder()
+    .setName("blackjack")
+    .setDescription("Play hit-or-stand blackjack against the dealer")
+    .addIntegerOption(o => o.setName("bet")
+      .setDescription("Your bet").setMinValue(1).setMaxValue(10000).setRequired(true)),
+
+  new SlashCommandBuilder()
     .setName("rps")
     .setDescription("Play rock paper scissors")
     .addStringOption(o => o.setName("choice")
@@ -180,18 +295,44 @@ const commands = [
       .setDescription("Who to roast").setRequired(true)),
 
   new SlashCommandBuilder()
-    .setName("setwelcome")
-    .setDescription("Configure the welcome channel")
-    .addChannelOption(o => o.setName("channel")
-      .setDescription("Welcome channel").setRequired(true))
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+    .setName("play")
+    .setDescription("Play a song from YouTube search or URL")
+    .addStringOption(o => o.setName("query")
+      .setDescription("Song name or YouTube URL").setRequired(true)),
 
   new SlashCommandBuilder()
-    .setName("setfun")
-    .setDescription("Configure the random message channel")
-    .addChannelOption(o => o.setName("channel")
-      .setDescription("Fun channel").setRequired(true))
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+    .setName("skip")
+    .setDescription("Skip the current song"),
+
+  new SlashCommandBuilder()
+    .setName("stop")
+    .setDescription("Stop music and clear the queue"),
+
+  new SlashCommandBuilder()
+    .setName("pause")
+    .setDescription("Pause the current song"),
+
+  new SlashCommandBuilder()
+    .setName("resume")
+    .setDescription("Resume the current song"),
+
+  new SlashCommandBuilder()
+    .setName("queue")
+    .setDescription("Show the music queue"),
+
+  new SlashCommandBuilder()
+    .setName("nowplaying")
+    .setDescription("Show the current song"),
+
+  new SlashCommandBuilder()
+    .setName("volume")
+    .setDescription("Set music volume")
+    .addIntegerOption(o => o.setName("amount")
+      .setDescription("Volume from 1 to 100").setMinValue(1).setMaxValue(100).setRequired(true)),
+
+  new SlashCommandBuilder()
+    .setName("leave")
+    .setDescription("Disconnect the bot from voice"),
 
   new SlashCommandBuilder()
     .setName("kick")
@@ -244,7 +385,7 @@ async function registerCommands() {
 }
 
 // STARTUP
-client.once("ready", () => {
+client.once("clientReady", () => {
   console.log(`${client.user.tag} is online!`);
 
   client.user.setPresence({
@@ -340,11 +481,11 @@ client.on("interactionCreate", async interaction => {
       return interaction.reply({
         embeds: [
           makeEmbed("COMMAND CENTRE",
-            "**ECONOMY**\n`/balance` `/daily` `/work` `/pay`\n\n" +
-            "**GAMES**\n`/coinflip` `/rps`\n\n" +
-            "**SERVER**\n`/leaderboard` `/rank`\n\n" +
+            "**ECONOMY**\n`/balance` `/daily` `/work` `/pay` `/leaderboard` `/rank`\n\n" +
+            "**GAMES & COINS**\n`/coinflip` `/rps` `/slots` `/dice` `/rob` `/crime` `/blackjack`\n\n" +
             "**FUN**\n`/joke` `/meme` `/roast`\n\n" +
-            "**ADMIN**\n`/setwelcome` `/setfun` `/kick` `/ban` `/timeout` `/clear`")
+            "**MUSIC**\n`/play` `/skip` `/stop` `/pause` `/resume` `/queue` `/nowplaying` `/volume` `/leave`\n\n" +
+            "**MODERATION**\n`/kick` `/ban` `/timeout` `/clear`")
         ]
       });
     }
@@ -471,6 +612,203 @@ client.on("interactionCreate", async interaction => {
             `${won ? "+" : "-"}${bet} coins`)
         ]
       });
+    }
+
+    // SLOTS
+    if (commandName === "slots") {
+      const bet = interaction.options.getInteger("bet");
+      if (data.coins < bet) return interaction.reply({ content: "You don't have enough coins!", ephemeral: true });
+      const symbols = ["🍒", "🍋", "🍇", "🍉", "⭐", "💎"];
+      const reels = Array.from({ length: 3 }, () => symbols[Math.floor(Math.random() * symbols.length)]);
+      let multiplier = 0;
+      if (reels.every(x => x === "💎")) multiplier = 10;
+      else if (reels.every(x => x === reels[0])) multiplier = 5;
+      else if (new Set(reels).size === 2) multiplier = 1.5;
+      data.coins -= bet;
+      const payout = Math.floor(bet * multiplier);
+      data.coins += payout;
+      save();
+      return interaction.reply({
+        embeds: [makeEmbed("SLOT MACHINE", `${reels.join("  ")}\\n\\n` +
+          (multiplier ? `🎉 You won **${payout} coins** (${multiplier}x payout)!` : `💀 No match. You lost **${bet} coins**.`) +
+          `\\n💰 Balance: **${data.coins.toLocaleString()} coins**`)]
+      });
+    }
+
+    // DICE
+    if (commandName === "dice") {
+      const guess = interaction.options.getInteger("guess");
+      const bet = interaction.options.getInteger("bet");
+      if (data.coins < bet) return interaction.reply({ content: "You don't have enough coins!", ephemeral: true });
+      const roll = Math.floor(Math.random() * 6) + 1;
+      const won = roll === guess;
+      data.coins += won ? bet * 4 : -bet;
+      save();
+      return interaction.reply({
+        embeds: [makeEmbed("DICE ROLL", `🎲 You guessed **${guess}**. The die landed on **${roll}**.\\n\\n` +
+          (won ? `🎉 Exact match! You won **${bet * 4} coins** profit!` : `💀 You lost **${bet} coins**.`) +
+          `\\n💰 Balance: **${data.coins.toLocaleString()} coins**`)]
+      });
+    }
+
+    // ROB
+    if (commandName === "rob") {
+      const target = interaction.options.getUser("user");
+      if (target.bot || target.id === user.id) return interaction.reply({ content: "Pick another human, not a bot or yourself.", ephemeral: true });
+      const targetData = getUser(guild.id, target.id);
+      if (Date.now() - data.lastRob < 30 * 60 * 1000) {
+        const mins = Math.ceil((30 * 60 * 1000 - (Date.now() - data.lastRob)) / 60000);
+        return interaction.reply({ content: `🚓 You're laying low. Try robbing again in ${mins} minutes.`, ephemeral: true });
+      }
+      if (targetData.coins < 20) return interaction.reply({ content: "That member doesn't have enough coins to rob.", ephemeral: true });
+      data.lastRob = Date.now();
+      const success = Math.random() < 0.45;
+      if (success) {
+        const stolen = Math.min(targetData.coins, Math.floor(Math.random() * 81) + 20);
+        targetData.coins -= stolen;
+        data.coins += stolen;
+        save();
+        return interaction.reply(`🦹 You successfully robbed ${target} and stole **${stolen} coins**!`);
+      }
+      const fine = Math.min(data.coins, Math.floor(Math.random() * 51) + 25);
+      data.coins -= fine;
+      save();
+      return interaction.reply(`🚨 You got caught trying to rob ${target}! You paid a **${fine}-coin fine**.`);
+    }
+
+    // CRIME
+    if (commandName === "crime") {
+      const now = Date.now();
+      if (now - data.lastCrime < 20 * 60 * 1000) {
+        const mins = Math.ceil((20 * 60 * 1000 - (now - data.lastCrime)) / 60000);
+        return interaction.reply({ content: `🚔 Cool off for ${mins} more minutes before your next job.`, ephemeral: true });
+      }
+      data.lastCrime = now;
+      const crimes = [
+        "You stole the mayor's garden gnome.",
+        "You smuggled 400 rubber ducks.",
+        "You hacked a vending machine (it only dispensed soup).",
+        "You attempted to steal the server's Wi-Fi."
+      ];
+      const story = crimes[Math.floor(Math.random() * crimes.length)];
+      const success = Math.random() < 0.5;
+      if (success) {
+        const reward = Math.floor(Math.random() * 201) + 100;
+        data.coins += reward;
+        save();
+        return interaction.reply({ embeds: [makeEmbed("JOB SUCCESS", `${story}\\n\\n💰 You escaped with **${reward} coins**!`)] });
+      }
+      const fine = Math.min(data.coins, Math.floor(Math.random() * 101) + 25);
+      data.coins -= fine;
+      save();
+      return interaction.reply({ embeds: [makeEmbed("BUSTED", `${story}\\n\\n🚨 You got caught and paid **${fine} coins** in fines.`)] });
+    }
+
+    // BLACKJACK
+    if (commandName === "blackjack") {
+      const bet = interaction.options.getInteger("bet");
+      if (data.coins < bet) return interaction.reply({ content: "You don't have enough coins!", ephemeral: true });
+
+      const deck = [];
+      for (const suit of ["♠️", "♥️", "♦️", "♣️"]) {
+        for (const rank of ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]) {
+          deck.push({ rank, suit, value: rank === "A" ? 11 : (["J", "Q", "K"].includes(rank) ? 10 : Number(rank)) });
+        }
+      }
+      for (let i = deck.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [deck[i], deck[j]] = [deck[j], deck[i]];
+      }
+      const draw = hand => hand.push(deck.pop());
+      const score = hand => {
+        let total = hand.reduce((sum, card) => sum + card.value, 0);
+        let aces = hand.filter(card => card.rank === "A").length;
+        while (total > 21 && aces > 0) { total -= 10; aces--; }
+        return total;
+      };
+      const show = hand => hand.map(card => `${card.rank}${card.suit}`).join("  ");
+      const player = [];
+      const dealer = [];
+      draw(player); draw(dealer); draw(player); draw(dealer);
+      const playerBlackjack = score(player) === 21;
+      const dealerBlackjack = score(dealer) === 21;
+
+      data.coins -= bet;
+      save();
+
+      if (playerBlackjack || dealerBlackjack) {
+        if (playerBlackjack && !dealerBlackjack) {
+          const payout = Math.floor(bet * 2.5);
+          data.coins += payout;
+          save();
+          return interaction.reply({ embeds: [makeEmbed("BLACKJACK!", `Your hand: ${show(player)} (**21**)\\nDealer: ${show(dealer)} (**${score(dealer)}**)\\n\\n🎉 Blackjack! Payout: **${payout} coins**.`)] });
+        }
+        if (playerBlackjack && dealerBlackjack) return interaction.reply({ embeds: [makeEmbed("BLACKJACK PUSH", `Both have blackjack. Your **${bet} coins** bet is returned.`)] });
+        data.coins -= bet;
+        save();
+        return interaction.reply({ embeds: [makeEmbed("DEALER BLACKJACK", `Dealer: ${show(dealer)} (**21**)\\nYou: ${show(player)}\\n\\n💀 You lost **${bet} coins**.`)] });
+      }
+
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`bj_hit_${user.id}`).setLabel("Hit").setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(`bj_stand_${user.id}`).setLabel("Stand").setStyle(ButtonStyle.Primary)
+      );
+      const gameMessage = await interaction.reply({
+        embeds: [makeEmbed("BLACKJACK", `Your hand: ${show(player)} (**${score(player)}**)\\nDealer shows: **${dealer[0].rank}${dealer[0].suit}** and one hidden card\\n\\nBet: **${bet} coins**`)],
+        components: [row],
+        fetchReply: true
+      });
+      const collector = gameMessage.createMessageComponentCollector({
+        time: 60000,
+        filter: i => i.user.id === user.id && i.customId.endsWith(user.id)
+      });
+      let finished = false;
+      const finish = async (resultText, payout = 0) => {
+        if (finished) return;
+        finished = true;
+        if (payout) { data.coins += payout; save(); }
+        await gameMessage.edit({
+          embeds: [makeEmbed("BLACKJACK", `Your hand: ${show(player)} (**${score(player)}**)\\nDealer: ${show(dealer)} (**${score(dealer)}**)\\n\\n${resultText}\\n💰 Balance: **${data.coins.toLocaleString()} coins**`)],
+          components: []
+        }).catch(() => {});
+        collector.stop();
+      };
+      collector.on("collect", async i => {
+        await i.deferUpdate();
+        if (i.customId.startsWith("bj_hit_")) {
+          draw(player);
+          if (score(player) > 21) return finish(`💥 Bust! You lost **${bet} coins**.`);
+          if (score(player) === 21) {
+            while (score(dealer) < 17) draw(dealer);
+            const ds = score(dealer);
+            if (ds > 21 || score(player) > ds) return finish(`🎉 You win! Payout: **${bet * 2} coins**.`, bet * 2);
+            if (score(player) === ds) return finish(`🤝 Push! Your bet is returned.`, bet);
+            return finish(`💀 Dealer wins. You lost **${bet} coins**.`);
+          }
+          await gameMessage.edit({
+            embeds: [makeEmbed("BLACKJACK", `Your hand: ${show(player)} (**${score(player)}**)\\nDealer shows: **${dealer[0].rank}${dealer[0].suit}** and one hidden card\\n\\nBet: **${bet} coins**`)],
+            components: [row]
+          }).catch(() => {});
+        } else {
+          while (score(dealer) < 17) draw(dealer);
+          const ps = score(player), ds = score(dealer);
+          if (ds > 21 || ps > ds) return finish(`🎉 You win! Payout: **${bet * 2} coins**.`, bet * 2);
+          if (ps === ds) return finish("🤝 Push! Your bet is returned.", bet);
+          return finish(`💀 Dealer wins. You lost **${bet} coins**.`);
+        }
+      });
+      collector.on("end", async () => {
+        if (!finished) {
+          finished = true;
+          data.coins += bet;
+          save();
+          await gameMessage.edit({
+            content: `⌛ Blackjack expired. Your **${bet} coins** bet was returned.`,
+            components: []
+          }).catch(() => {});
+        }
+      });
+      return;
     }
 
     // ROCK PAPER SCISSORS
@@ -603,38 +941,101 @@ client.on("interactionCreate", async interaction => {
       );
     }
 
-    // SET WELCOME CHANNEL
-    if (commandName === "setwelcome") {
-      const channel = interaction.options.getChannel("channel");
+    // MUSIC COMMANDS
+    if (["play", "skip", "stop", "pause", "resume", "queue", "nowplaying", "volume", "leave"].includes(commandName)) {
+      const voiceChannel = getMemberVoiceChannel(interaction);
+      const queue = getMusicQueue(guild.id);
 
-      if (!channel.isTextBased() || !channel.guild) {
-        return interaction.reply({
-          content: "Choose a server text channel.",
-          ephemeral: true
-        });
+      if (commandName === "play") {
+        if (!voiceChannel) return interaction.reply({ content: "Join a voice channel first!", ephemeral: true });
+        await interaction.deferReply();
+        const query = interaction.options.getString("query");
+        let result;
+        try {
+          if (/^https?:\/\//i.test(query)) {
+            result = await play.video_info(query);
+            const video = result.video_details;
+            if (!video || !video.url) throw new Error("Unsupported video URL.");
+            queue.songs.push({ title: video.title || "Unknown title", url: video.url });
+          } else {
+            const results = await play.search(query, { limit: 1 });
+            if (!results.length) return interaction.editReply("I couldn't find that song.");
+            queue.songs.push({ title: results[0].title, url: results[0].url });
+          }
+
+          if (!queue.connection || queue.connection.state.status === VoiceConnectionStatus.Destroyed) {
+            queue.connection = joinVoiceChannel({
+              channelId: voiceChannel.id,
+              guildId: guild.id,
+              adapterCreator: guild.voiceAdapterCreator,
+              selfDeaf: true
+            });
+            queue.connection.subscribe(queue.player);
+            await entersState(queue.connection, VoiceConnectionStatus.Ready, 20_000);
+          } else if (queue.connection.joinConfig.channelId !== voiceChannel.id) {
+            return interaction.editReply("I'm already playing in another voice channel. Use `/leave` first.");
+          }
+          queue.textChannel = interaction.channel;
+          const added = queue.songs[queue.songs.length - 1];
+          if (!queue.current && !queue.starting) await playNext(queue);
+          return interaction.editReply(`➕ Added to queue: **${added.title}**`);
+        } catch (error) {
+          console.error("Play command error:", error);
+          return interaction.editReply("I couldn't play that track. Check the URL or try another search.");
+        }
       }
 
-      settings.welcomeChannel = channel.id;
-      save();
-
-      return interaction.reply(`💛 Welcome channel set to ${channel}!`);
-    }
-
-    // SET RANDOM MESSAGE CHANNEL
-    if (commandName === "setfun") {
-      const channel = interaction.options.getChannel("channel");
-
-      if (!channel.isTextBased() || !channel.guild) {
-        return interaction.reply({
-          content: "Choose a server text channel.",
-          ephemeral: true
-        });
+      if (!queue.connection || queue.connection.state.status === VoiceConnectionStatus.Destroyed) {
+        return interaction.reply({ content: "I'm not playing anything right now.", ephemeral: true });
       }
 
-      settings.funChannel = channel.id;
-      save();
+      if (commandName !== "queue" && !voiceChannel) {
+        return interaction.reply({ content: "Join my voice channel to control music.", ephemeral: true });
+      }
 
-      return interaction.reply(`💛 Random messages will appear in ${channel}!`);
+      if (commandName === "skip") {
+        if (!queue.current) return interaction.reply("Nothing is playing.");
+        queue.player.stop(true);
+        return interaction.reply("⏭️ Skipped the current track.");
+      }
+      if (commandName === "stop") {
+        queue.songs = [];
+        queue.current = null;
+        queue.player.stop(true);
+        return interaction.reply("⏹️ Music stopped and queue cleared.");
+      }
+      if (commandName === "pause") {
+        const paused = queue.player.pause();
+        return interaction.reply(paused ? "⏸️ Paused." : "I couldn't pause the track.");
+      }
+      if (commandName === "resume") {
+        const resumed = queue.player.unpause();
+        return interaction.reply(resumed ? "▶️ Resumed." : "I couldn't resume the track.");
+      }
+      if (commandName === "queue") {
+        const lines = [];
+        if (queue.current) lines.push(`**Now:** ${queue.current.title}`);
+        queue.songs.slice(0, 10).forEach((song, index) => lines.push(`**${index + 1}.** ${song.title}`));
+        return interaction.reply({ embeds: [makeEmbed("MUSIC QUEUE", lines.join("\\n") || "The queue is empty.")] });
+      }
+      if (commandName === "nowplaying") {
+        return interaction.reply(queue.current ? `🎶 Now playing: **${queue.current.title}**` : "Nothing is playing.");
+      }
+      if (commandName === "volume") {
+        const amount = interaction.options.getInteger("amount");
+        queue.volume = amount;
+        if (queue.current?.resource?.volume) queue.current.resource.volume.setVolume(amount / 100);
+        return interaction.reply(`🔊 Volume set to **${amount}%**.`);
+      }
+      if (commandName === "leave") {
+        queue.songs = [];
+        queue.current = null;
+        queue.player.stop(true);
+        queue.connection.destroy();
+        queue.connection = null;
+        musicQueues.delete(guild.id);
+        return interaction.reply("👋 Left the voice channel.");
+      }
     }
 
     // KICK AND BAN
